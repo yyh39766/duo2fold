@@ -13,8 +13,8 @@
 | 项 | 状态 |
 |---|---|
 | 源码 | ✅ 完整，可直接 `make package` |
-| 编译验证 | ❌ **未验证**。开发环境是 Windows，没有 macOS / Theos / ldid |
-| 真机验证 | ❌ **未验证**。没有设备 |
+| 编译验证 | ✅ **已通过**。GitHub Actions (macos-14) 双架构 arm64 + arm64e 出包成功 |
+| 真机验证 | ⚠️ **部分验证**。iOS 16.4.1 上确认加载/挂载/渲染通路正常（自检闪光可见），驱动量已在 v1.2 修正，待复测 |
 | 效果正确的置信度 | 代码模式（`CAFilter` + `layer.filters`）是社区广泛使用的成熟写法，但**首次编译大概率有若干小报错**，需要按报错逐条修 |
 | 图形设置界面 | ❌ 未做。设置走 plist + `notifyutil` 热重载 |
 
@@ -23,14 +23,16 @@
 ## 3. 文件地图
 
 ```
-duofold/
+（仓库根目录）
 ├── Makefile                      构建配置（rootless/rootful 开关在这里）
 ├── control                       deb 元数据（包名/版本/依赖）
 ├── Tweak.x                       全部实现（单文件，约 330 行）
+├── DuoFold.plist                 注入过滤器，只注入 com.apple.springboard
 ├── build.sh                      一键 clean + package
 ├── README.md                     面向使用者的文档（构建/安装/参数）
-└── layout/Library/MobileSubstrate/DynamicLibraries/
-    └── DuoFold.plist             注入过滤器，只注入 com.apple.springboard
+├── AGENTS.md / HANDOFF.md        给 AI 的交接文档
+├── .gitignore
+└── .github/workflows/build.yml   GitHub Actions：macOS runner 上编译出 deb
 ```
 
 `Tweak.x` 内部分区（按顺序）：
