@@ -1,9 +1,19 @@
 // DuoFold —— 陀螺仪驱动的「磨砂玻璃桌面」  iOS 15–17 越狱插件
 //
-// 原理: 以「标定姿态」为参考，用当前重力向量与参考重力向量的夹角作为强度 0…1，
-//       驱动 SpringBoard 桌面图层上私有 CAFilter(gaussianBlur) 的 inputRadius，
-//       并叠加一层压暗 / 白雾覆盖层，得到「屏幕变成一块毛玻璃」的观感。
-//       强度归零时会彻底卸下 filter，静止状态零渲染开销。
+// 原理（v1.2）:
+//   以「零倾斜姿态」为参考，算出手 **绕屏幕 Y 轴的滚转角**（也就是左右倾，带正负号），
+//   用它作为强度 0…1，驱动 SpringBoard 桌面图层上私有 CAFilter(gaussianBlur) 的 inputRadius，
+//   并叠加一层压暗 / 白雾覆盖层，得到「屏幕变成一块毛玻璃」的观感。
+//   强度归零时会彻底卸下 filter，静止状态零渲染开销。
+//
+//   ⚠️ v1.1 及以前用的是「当前重力向量与参考重力向量的夹角」，那是错的：
+//      左右倾 = 绕屏幕 Y 轴的旋转，而竖握手机时屏幕 Y 轴与重力同向，
+//      绕它转不改变重力向量 —— 重力在原理上就测不到这个旋转。
+//      量化：后仰 25° 的握姿下左右滚转 20°，重力夹角只变化 8.5°，
+//      被死区一卡就完全没反应。所以 v1.2 改用 attitude 全姿态矩阵。
+//
+//   运动模型参考 elijah-semyonov/DuoLikeAnimation（MIT）：
+//   陀螺仪 40ms 前瞻 + 每样本收敛 70% 的轻量平滑。
 //
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -15,6 +25,7 @@
 #import <math.h>
 #import <stdlib.h>
 #import <stdarg.h>
+#import <string.h>
 #import <dlfcn.h>
 
 #define DUO_PREFS   @"/var/mobile/Library/Preferences/com.yourname.duofold.plist"
@@ -140,12 +151,69 @@ static double duo_oneEuro(DuoOneEuro *f, double x, double dt) {
     return xHat;
 }
 
-#pragma mark - 陀螺样本（后台队列写，主线程读）
+#pragma mark - 3x3 矩阵工具（把 attitude 换算成「绕屏幕 Y 轴的倾角」）
+
+// 为什么不能用重力向量？
+//   「左右倾」是绕屏幕 Y 轴的滚转。竖握手机时屏幕 Y 轴差不多和重力同向，
+//   绕它转**不改变重力向量** —— 重力在原理上测不到这个旋转。
+//   量化：后仰 25° 的握姿下，左右滚转 20° 只让「重力夹角」变化 8.5°；
+//   滚转 45° 也只有 18.6°。死区一卡就完全没反应。
+// 所以必须用 attitude 全姿态矩阵。做法参考 elijah-semyonov/DuoLikeAnimation（MIT）。
+
+typedef struct { double m[3][3]; } DuoMat3;   // m[行][列]
+
+static DuoMat3 DuoMat3FromRotationMatrix(CMRotationMatrix r) {
+    DuoMat3 a;
+    a.m[0][0] = r.m11; a.m[0][1] = r.m12; a.m[0][2] = r.m13;
+    a.m[1][0] = r.m21; a.m[1][1] = r.m22; a.m[1][2] = r.m23;
+    a.m[2][0] = r.m31; a.m[2][1] = r.m32; a.m[2][2] = r.m33;
+    return a;
+}
+
+static DuoMat3 DuoMat3Transpose(DuoMat3 a) {
+    DuoMat3 t;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            t.m[i][j] = a.m[j][i];
+    return t;
+}
+
+static DuoMat3 DuoMat3Mul(DuoMat3 a, DuoMat3 b) {
+    DuoMat3 c;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            double s = 0.0;
+            for (int k = 0; k < 3; k++) s += a.m[i][k] * b.m[k][j];
+            c.m[i][j] = s;
+        }
+    }
+    return c;
+}
+
+static double DuoVec3Dot(const double a[3], const double b[3]) {
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+static void DuoMat3Apply(DuoMat3 a, const double v[3], double out[3]) {
+    for (int i = 0; i < 3; i++)
+        out[i] = a.m[i][0]*v[0] + a.m[i][1]*v[1] + a.m[i][2]*v[2];
+}
+
+#pragma mark - 传感器样本（后台队列写，主线程读）
 
 static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
-static CMAcceleration gGravity;
-static double         gRotationRate;
-static BOOL           gValid;
+
+// ── 姿态 → 绕屏幕 Y 轴的有符号倾角（度）─────────────────────────────
+static double         gTiltDeg;        // 正负号表示哪一侧抬起，留给 1.3 做方向性观感
+static BOOL           gTiltValid;      // 参考姿态是否已标定
+static DuoMat3        gRefMat;         // 标定时的姿态矩阵
+static BOOL           gHasRefMat;
+static int            gRowConv;        // -1 未知 / 0 用原矩阵 / 1 用转置（运行时判定）
+static int            gCalibCount;     // 等静止标定的计时（样本数）
+static double         gTiltSmooth;     // 参考项目的轻量平滑状态（弧度）
+// 屏幕 X / Y 轴在设备坐标系中的方向，随界面朝向变化（主线程更新）
+static double         gScreenX[3] = {1.0, 0.0, 0.0};
+static double         gScreenY[3] = {0.0, 1.0, 0.0};
 
 static UIImage *DuoGrainImage(void);   // 前向声明
 
@@ -160,10 +228,8 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     UIView          *_dimView, *_frostView, *_grainView;
     id               _blurFilter;
     DuoSettings      _s;
-    CMAcceleration   _ref;
-    BOOL             _hasRef, _attached, _started, _pendingCalib;
+    BOOL             _attached, _started;
     CGFloat          _amount;
-    double           _still;
     double           _maxTheta;          // 自检：本次运行见过的最大倾角
     int              _selfTestLeft;      // 自检闪光：还要闪几次
     int              _selfTestCooldown;  // 自检闪光：距下次闪还有多少帧
@@ -190,6 +256,7 @@ static UIImage *DuoGrainImage(void);   // 前向声明
 - (void)attachFilters;
 - (void)detachFilters;
 - (void)hostOverlays;
+- (void)updateScreenAxes:(UIWindow *)host;
 - (UIView *)homeScreenView;
 - (UIView *)firstViewIn:(NSArray *)roots classLike:(NSString *)needle;
 @end
@@ -241,26 +308,88 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     q.maxConcurrentOperationCount = 1;
     q.qualityOfService = NSQualityOfServiceUtility;
     _motionQueue = q;      // 自己持有一份，别指望 CoreMotion 一定 retain
+
+    // 参考项目用 120Hz；这里跟显示刷新率走 60Hz 已经够（display link 也是 60）
     [_motion startDeviceMotionUpdatesUsingReferenceFrame:CMAttitudeReferenceFrameXArbitraryZVertical
                                                  toQueue:q
                                              withHandler:^(CMDeviceMotion *m, NSError *err) {
         if (!m) return;
+
+        double rate = sqrt(m.rotationRate.x * m.rotationRate.x +
+                           m.rotationRate.y * m.rotationRate.y +
+                           m.rotationRate.z * m.rotationRate.z);
+
+        double tiltDeg = 0.0;
+        BOOL   gotRef  = NO;
+        double convScore = 0.0;
+
         os_unfair_lock_lock(&gLock);
-        gGravity      = m.gravity;
-        gRotationRate = sqrt(m.rotationRate.x * m.rotationRate.x +
-                             m.rotationRate.y * m.rotationRate.y +
-                             m.rotationRate.z * m.rotationRate.z);
-        gValid        = YES;
-        CMAcceleration gg = gGravity;
-        double rr = gRotationRate;
+        {
+            DuoMat3 asRows = DuoMat3FromRotationMatrix(m.attitude.rotationMatrix);
+
+            // 旋转矩阵的「行」到底是设备轴还是参考轴，文档没写清楚 ——
+            // 用重力对一下：重力在设备系里指向下（参考系里是 -Z）。
+            // 哪种约定预测得更准，就用哪种。
+            if (gRowConv < 0) {
+                double gv[3] = { m.gravity.x, m.gravity.y, m.gravity.z };
+                double gn = sqrt(DuoVec3Dot(gv, gv));
+                if (gn > 0.1) {
+                    gv[0] /= gn; gv[1] /= gn; gv[2] /= gn;
+                    const double down[3] = { 0.0, 0.0, -1.0 };
+                    double p1[3], p2[3];
+                    DuoMat3Apply(asRows, down, p1);
+                    DuoMat3Apply(DuoMat3Transpose(asRows), down, p2);
+                    double s1 = DuoVec3Dot(gv, p1);
+                    double s2 = DuoVec3Dot(gv, p2);
+                    convScore = fabs(s1 - s2);
+                    if (convScore > 0.2) gRowConv = (s1 > s2) ? 1 : 0;
+                }
+            }
+            DuoMat3 d2r = (gRowConv == 1) ? DuoMat3Transpose(asRows) : asRows;
+
+            if (!gHasRefMat) {
+                // 等设备静止一下再定参考（最多等 1 秒），避免开机瞬间手在动导致参考跑偏
+                gCalibCount++;
+                if (rate < 0.15 || gCalibCount > 60) {
+                    gRefMat    = d2r;
+                    gHasRefMat = YES;
+                    gTiltSmooth = 0.0;
+                    gTiltDeg   = 0.0;
+                    gotRef     = YES;
+                }
+            } else {
+                // relative = reference^T * current，它的第三列就是「当前屏幕法线在标定系里的坐标」
+                DuoMat3 rel = DuoMat3Mul(DuoMat3Transpose(gRefMat), d2r);
+                double nx = rel.m[0][2], ny = rel.m[1][2], nz = rel.m[2][2];
+
+                // 绕屏幕 Y 轴的有符号倾角（屏幕 X 轴朝向由界面朝向决定）
+                double measured = atan2(nx * gScreenX[0] + ny * gScreenX[1] + nz * gScreenX[2], nz);
+
+                // 陀螺仪前瞻 40ms：补掉「传感器 → 合成 → 显示」这条链路的延迟，
+                // 不然手上动作和画面之间会有明显脱节
+                double rateY = m.rotationRate.x * gScreenY[0]
+                             + m.rotationRate.y * gScreenY[1]
+                             + m.rotationRate.z * gScreenY[2];
+                double predicted = measured + rateY * 0.04;
+
+                // 轻量平滑：attitude 本身已经是融合过的，多滤一帧就多一帧肉眼可见的延迟
+                gTiltSmooth += (predicted - gTiltSmooth) * 0.7;
+                tiltDeg = gTiltSmooth * 180.0 / M_PI;
+            }
+
+            gTiltDeg      = tiltDeg;
+            gTiltValid    = gHasRefMat;
+        }
         os_unfair_lock_unlock(&gLock);
 
-        // 自检：确认陀螺仪/加速度计真的在回调（第 1 次 + 之后每 5 秒一次）
+        if (gotRef) DuoDiag(@"姿态参考已标定（attitude 矩阵，约定=%d）", gRowConv);
+
+        // 自检：确认传感器真的在回调（第 1 次 + 之后每 5 秒一次）
         static int n = 0;
         n++;
         if (n == 1 || (n % 300) == 0) {
-            DuoDiag(@"motion #%d  gravity=(%.3f, %.3f, %.3f)  rate=%.3f",
-                    n, gg.x, gg.y, gg.z, rr);
+            DuoDiag(@"motion #%d  tilt=%+.2f°  rate=%.3f  conv=%d",
+                    n, tiltDeg, rate, gRowConv);
         }
     }];
 
@@ -305,13 +434,8 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     _ticks++;
     if ((_ticks % 120) == 0) [self refreshTargets];   // 兜底：页面/窗口变化后重新挂载
 
-    os_unfair_lock_lock(&gLock);
-    CMAcceleration g = gGravity; double rate = gRotationRate; BOOL ok = gValid;
-    os_unfair_lock_unlock(&gLock);
-    if (!ok) return;
-
     // ── 启动自检闪光 ──────────────────────────────────────────────────
-    // 放在最前面，绕过标定逻辑 —— 就算标定失败也能验证渲染通路。
+    // 放在最前面，绕过标定逻辑，也不依赖传感器是否已就绪
     if (_selfTestLeft > 0) {
         if (_selfTestTicks > 0) {
             _selfTestTicks--;
@@ -328,57 +452,38 @@ static UIImage *DuoGrainImage(void);   // 前向声明
         }
     }
 
-    double dt = (link.duration > 0) ? link.duration : 1.0 / 60.0;
+    os_unfair_lock_lock(&gLock);
+    BOOL   ok      = gTiltValid;    // 姿态参考标定好了没
+    double tiltDeg = gTiltDeg;      // 绕屏幕 Y 轴的有符号倾角
+    os_unfair_lock_unlock(&gLock);
 
-    // ── 参考姿态（标定）──────────────────────────────────────────────
-    // 原实现把「拿到参考姿态」完全押在 _pendingCalib 上，而 _pendingCalib 只有
-    // 手动发 `notifyutil -p com.yourname.duofold/recalibrate` 才会被置位，
-    // 所以 _hasRef 会一直是 NO → 下面直接 return → 插件看起来「完全没效果」。
-    //
-    // 现在改成自动标定：没有参考时，等设备静止约 0.5 秒就抓当前姿态当参考；
-    // 如果设备一直在动，最多等 3 秒也强制抓一次，保证一定会启动。
-    if (!_hasRef || _pendingCalib) {
-        if (_pendingCalib) { _still = 1.0; _pendingCalib = NO; }   // 手动校准立刻生效
-        else if (rate < 0.15) { _still += dt; } else { _still = 0; }
-        if (_still > 0.5 || _ticks > 180) {
-            _ref = g; _hasRef = YES; _still = 0;
-            DuoDiag(@"参考姿态已标定: (%.3f, %.3f, %.3f)  用时 %.2fs",
-                    _ref.x, _ref.y, _ref.z, (double)_ticks / 60.0);
-        } else if ((_ticks % 120) == 0) {
-            DuoDiag(@"等待标定… tick=%lu rate=%.3f still=%.2f",
-                    (unsigned long)_ticks, rate, _still);
-        }
+    if (!ok) {
+        if ((_ticks % 120) == 0) DuoDiag(@"等待姿态参考标定… tick=%lu", (unsigned long)_ticks);
         return;
     }
 
-    // 静止自校准：只在「已经回正」时更新参考，避免保持倾斜姿态时效果自己跑掉。
-    // 重力向量本身无漂移，所以这只是为了修正开机时姿态不对的情况。
-    if (rate < 0.15 && _amount < 0.02) { _still += dt; } else { _still = 0; }
-    if (_still > 3.0) { _ref = g; _still = 0; }
+    double dt = (link.duration > 0) ? link.duration : 1.0 / 60.0;
 
     if (!_s.enabled) { [self applyAmount:0.0]; return; }
 
-    double dot   = g.x * _ref.x + g.y * _ref.y + g.z * _ref.z;
-    double theta = acos(duo_clamp(dot, -1.0, 1.0)) * 180.0 / M_PI;   // 与标定姿态的夹角
+    // ── 驱动量 ────────────────────────────────────────────────────────
+    // tiltDeg 是「绕屏幕 Y 轴的滚转角」，也就是真正意义上的左右倾：
+    //   竖握手机滚转 20° → 这里就是 20°（旧的「重力夹角」写法只有 8.5°，会被死区整个吃掉）
+    // 正负号 = 哪一侧抬起，1.3 做方向性观感时会用到；强度只用绝对值。
+    double theta = fabs(tiltDeg);
     if (theta > _maxTheta) _maxTheta = theta;
 
-    // ── 驱动量的换算 ────────────────────────────────────────────────
-    // 注意：这里的 theta 是「重力向量夹角」，它天然偏向俯仰（前后倾），
-    // 对「左右倾」（绕屏幕竖轴滚转）极不敏感 —— 竖握手机左右倾 20°，
-    // 重力夹角只有 ~8°。所以默认死区/量程必须调得比直觉小，
-    // 否则自然左右倾根本迈不过死区，看起来就是「完全没效果」。
-    // 1.2 会换成「绕屏幕 Y 轴的有符号倾角」（需要 attitude 矩阵），彻底解决方向性问题。
     double span  = MAX(1.0, _s.fullRangeDeg - _s.deadZoneDeg);
     double raw   = duo_clamp((theta - _s.deadZoneDeg) / span, 0.0, 1.0);
     raw = raw * raw * (3.0 - 2.0 * raw);                             // smoothstep，起手更柔
 
     CGFloat amount = (CGFloat)duo_clamp(duo_oneEuro(&_euro, raw, dt), 0.0, 1.0);
 
-    // 自检心跳：每 5 秒一行，倾斜手机时看 theta / amount 有没有跟着变
+    // 自检心跳：每 5 秒一行，倾斜手机时看 tilt / amount 有没有跟着变
     if ((_ticks % 300) == 0) {
-        DuoDiag(@"tick=%lu  theta=%.1f°(峰值%.1f°)  raw=%.3f  amount=%.3f  "
+        DuoDiag(@"tick=%lu  tilt=%+.1f°(峰值%.1f°)  raw=%.3f  amount=%.3f  "
                 @"targets=%lu  attached=%d  filter=%@  deadZone=%.0f fullRange=%.0f",
-                (unsigned long)_ticks, theta, _maxTheta, raw, amount,
+                (unsigned long)_ticks, tiltDeg, _maxTheta, raw, amount,
                 (unsigned long)_targets.count, _attached,
                 _blurFilter ? @"有" : @"无", _s.deadZoneDeg, _s.fullRangeDeg);
     }
@@ -547,9 +652,51 @@ static UIImage *DuoGrainImage(void);   // 前向声明
         lastSummary = summary;
     }
 
+    // 刷新「屏幕 X/Y 轴在设备坐标系里的方向」—— 它随界面朝向变化，
+    // 而倾角计算必须知道屏幕的竖直轴到底指向哪，否则横屏时左右倾会算成前后倾。
+    [self updateScreenAxes:(found.count ? ((UIView *)found[0]).window : nil)];
+
     [self detachFilters];          // 先卸旧的
     _targets = found;
     if (_amount > 0.002) [self applyAmount:_amount];
+}
+
+// 把屏幕的竖直轴（绕它转才是「左右倾」）换算到设备坐标系，供传感器队列使用
+- (void)updateScreenAxes:(UIWindow *)host {
+    UIInterfaceOrientation o = UIInterfaceOrientationPortrait;
+    if (@available(iOS 13.0, *)) {
+        if (host.windowScene) o = host.windowScene.interfaceOrientation;
+    }
+    if (o == UIInterfaceOrientationUnknown) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        o = [UIApplication sharedApplication].statusBarOrientation;
+#pragma clang diagnostic pop
+    }
+
+    double sx[3], sy[3];
+    switch (o) {
+        case UIInterfaceOrientationLandscapeLeft:
+            sx[0] =  0; sx[1] =  1; sx[2] = 0;
+            sy[0] = -1; sy[1] =  0; sy[2] = 0;
+            break;
+        case UIInterfaceOrientationLandscapeRight:
+            sx[0] =  0; sx[1] = -1; sx[2] = 0;
+            sy[0] =  1; sy[1] =  0; sy[2] = 0;
+            break;
+        case UIInterfaceOrientationPortraitUpsideDown:
+            sx[0] = -1; sx[1] =  0; sx[2] = 0;
+            sy[0] =  0; sy[1] = -1; sy[2] = 0;
+            break;
+        default:
+            sx[0] =  1; sx[1] =  0; sx[2] = 0;
+            sy[0] =  0; sy[1] =  1; sy[2] = 0;
+            break;
+    }
+    os_unfair_lock_lock(&gLock);
+    memcpy(gScreenX, sx, sizeof(sx));
+    memcpy(gScreenY, sy, sizeof(sy));
+    os_unfair_lock_unlock(&gLock);
 }
 
 #pragma mark 覆盖层（压暗 / 白雾 / 颗粒）
@@ -574,8 +721,10 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     DuoSettings s;
     s.enabled       = d[@"enabled"]       ? [d[@"enabled"] boolValue]        : YES;
     s.maxRadius     = d[@"maxRadius"]     ? [d[@"maxRadius"] doubleValue]    : 26.0;
-    s.deadZoneDeg   = d[@"deadZoneDeg"]   ? [d[@"deadZoneDeg"] doubleValue]  : 3.0;
-    s.fullRangeDeg  = d[@"fullRangeDeg"]  ? [d[@"fullRangeDeg"] doubleValue] : 20.0;
+    // 1.2 起驱动量换成了「绕屏幕 Y 轴的滚转角」，量纲就是真实的倾角，
+    // 所以默认值回到符合直觉的区间：几乎无死区，25° 左右拉满
+    s.deadZoneDeg   = d[@"deadZoneDeg"]   ? [d[@"deadZoneDeg"] doubleValue]  : 2.0;
+    s.fullRangeDeg  = d[@"fullRangeDeg"]  ? [d[@"fullRangeDeg"] doubleValue] : 25.0;
     s.darkening     = d[@"darkening"]     ? [d[@"darkening"] doubleValue]    : 0.35;
     s.frost         = d[@"frost"]         ? [d[@"frost"] doubleValue]        : 0.08;
     s.grain         = d[@"grain"]         ? [d[@"grain"] doubleValue]        : 0.0;
@@ -588,11 +737,16 @@ static UIImage *DuoGrainImage(void);   // 前向声明
 }
 
 - (void)calibrate {
+    // 把「零倾斜姿态」清掉，下一个传感器样本就会成为新的参考
+    // （传感器队列上看到 gHasRefMat == NO 就会重新标定）
     os_unfair_lock_lock(&gLock);
-    CMAcceleration g = gGravity; BOOL ok = gValid;
+    gHasRefMat  = NO;
+    gCalibCount = 0;
+    gTiltSmooth = 0.0;
+    gTiltDeg    = 0.0;
+    gTiltValid  = NO;
     os_unfair_lock_unlock(&gLock);
-    if (!ok) { _pendingCalib = YES; return; }   // 还没样本，等第一帧
-    _ref = g; _hasRef = YES; _still = 0;
+    DuoDiag(@"已请求重新标定（下一次采样生效）");
 }
 
 @end
