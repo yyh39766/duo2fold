@@ -10,10 +10,44 @@
 //
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <stdlib.h>
+#import <spawn.h>
 #import <notify.h>
 
+// iOS SDK 里 system() 被标记 __API_UNAVAILABLE(ios)，编译直接报
+// "'system' is unavailable: not available on iOS" —— 只能走 posix_spawn。
+extern char **environ;
+
+static void DuoSpawn(NSString *launchPath, NSArray<NSString *> *args) {
+    if (![[NSFileManager defaultManager] fileExistsAtPath:launchPath]) return;
+
+    // argv: 程序名 + 参数 + NULL 结尾。全部在调用期间保持存活。
+    const char *path  = launchPath.UTF8String;
+    const char *argv[args.count + 2];
+    const char *cstr[args.count];
+    argv[0] = path;
+    for (NSUInteger i = 0; i < args.count; i++) {
+        cstr[i]  = args[i].UTF8String;
+        argv[i + 1] = cstr[i];
+    }
+    argv[args.count + 1] = NULL;
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    pid_t pid = -1;
+    int rc = posix_spawn(&pid, path, NULL, &attr, (char *const *)argv, environ);
+    posix_spawnattr_destroy(&attr);
+    (void)rc;   // 失败（面板进程无法 spawn）就静默放弃，不值得为此弹错误框
+}
+
+// 自声明一份 PSListController（见文件头注释）
 @interface PSListController : UIViewController
+@end
+
+// ★ 关键：必须先声明子类接口再写 @implementation。
+//   少了这一段，clang 报 "cannot find interface declaration for 'DuoFoldPrefs'"
+//   和 "class defined without specifying a base class"（-Werror 直接失败），
+//   且 self 变成无类型 → 所有 UIViewController 方法全部 "no visible @interface"。
+@interface DuoFoldPrefs : PSListController
 @end
 
 @implementation DuoFoldPrefs
@@ -40,8 +74,7 @@
     if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/usr/bin/launchctl"]) {
         lctl = @"/var/jb/usr/bin/launchctl";
     }
-    system([[NSString stringWithFormat:@"%@ kickstart -k system/com.apple.backboardd", lctl]
-            UTF8String]);
+    DuoSpawn(lctl, @[@"kickstart", @"-k", @"system/com.apple.backboardd"]);
 }
 
 @end
