@@ -1,25 +1,49 @@
-// DuoFold —— 陀螺仪驱动的「磨砂玻璃桌面」  iOS 15–17 越狱插件
+// DuoFold —— 陀螺仪驱动的「折叠玻璃」桌面  iOS 15–17 越狱插件
 //
-// 原理（v1.2）:
-//   以「零倾斜姿态」为参考，算出手 **绕屏幕 Y 轴的滚转角**（也就是左右倾，带正负号），
-//   用它作为强度 0…1，驱动 SpringBoard 桌面图层上私有 CAFilter(gaussianBlur) 的 inputRadius，
-//   并叠加一层压暗 / 白雾覆盖层，得到「屏幕变成一块毛玻璃」的观感。
-//   强度归零时会彻底卸下 filter，静止状态零渲染开销。
+// ═══════════════════════════════════════════════════════════════════════════
+//  效果原理（v2.0）
+// ═══════════════════════════════════════════════════════════════════════════
 //
-//   ⚠️ v1.1 及以前用的是「当前重力向量与参考重力向量的夹角」，那是错的：
-//      左右倾 = 绕屏幕 Y 轴的旋转，而竖握手机时屏幕 Y 轴与重力同向，
-//      绕它转不改变重力向量 —— 重力在原理上就测不到这个旋转。
-//      量化：后仰 25° 的握姿下左右滚转 20°，重力夹角只变化 8.5°，
-//      被死区一卡就完全没反应。所以 v1.2 改用 attitude 全姿态矩阵。
+//  想象桌面上方悬着一块玻璃盖板，它的一条边（「铰链」）压在屏幕边缘上，
+//  另一条边朝你翘起来。手机往哪边倾，玻璃就绕那一边合拢过去。
 //
-//   运动模型参考 elijah-semyonov/DuoLikeAnimation（MIT）：
-//   陀螺仪 40ms 前瞻 + 每样本收敛 70% 的轻量平滑。
+//  数学取自 elijah-semyonov/DuoLikeAnimation（MIT）的 Metal 着色器：
+//
+//      d(p)     = 像素到铰链的距离（沿屏幕 X 轴）              pt
+//      gap(p)   = d · sin(θ)         玻璃与桌面在该点的间隙      pt
+//      r(p)     = blurSpread · gap   该点的模糊半径             pt
+//      dim(p)   = darkening · r      该点的吸光量（越糊越暗）
+//
+//  关键观察：**这两个量都只沿屏幕 X 轴变化，与 Y 无关**。
+//  所以整块玻璃的模糊/压暗可以拆成「一条水平渐变」——
+//  而私有 CAFilter 的 `variableBlur` 类型正是「按 mask 的 alpha 逐像素决定半径」。
+//
+//  原作是在 Metal 里逐像素做光线投射重投影，SpringBoard 里没有 SwiftUI 的
+//  layerEffect，做不了那个；但重投影在当前参数下的位移极小
+//  （eyeDistance 1920pt、gap 最大约 140pt → 位移约 10pt），
+//  肉眼主要感知到的是「靠铰链清晰、远端越糊越暗」这个梯度，正是本插件所做的。
+//
+//  v1.x 的做法是给桌面图层挂一个均匀半径的 gaussianBlur —— 那是「整屏一起糊」，
+//  没有方向、没有梯度，看起来是磨砂玻璃但不像「折叠」。v2.0 换掉了这一层。
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  驱动量（为什么必须用 attitude 矩阵而不是重力）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  「左右倾」是绕屏幕 Y 轴的滚转。竖握手机时屏幕 Y 轴与重力几乎同向，
+//  绕它转**不改变重力向量** —— 重力在原理上测不到这个旋转。
+//  量化：后仰 25° 握姿下左右滚转 20°，重力夹角只变化 8.5°。
+//  所以必须用 CMDeviceMotion.attitude 的全姿态矩阵。
+//
+//  另外抄了原作的「陀螺仪 40ms 前瞻」+「每样本收敛 70% 的轻量平滑」，
+//  用来补掉传感器→合成→显示这条链路的延迟。
 //
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreMotion/CoreMotion.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <os/lock.h>
 #import <notify.h>
 #import <math.h>
@@ -29,6 +53,7 @@
 #import <dlfcn.h>
 
 #define DUO_PREFS   @"/var/mobile/Library/Preferences/com.yourname.duofold.plist"
+#define DUO_BUNDLE  @"com.yourname.duofold"
 #define DUO_RELOAD  "com.yourname.duofold/reload"
 #define DUO_RECALIB "com.yourname.duofold/recalibrate"
 
@@ -114,18 +139,22 @@ static void DuoDiagOnce(BOOL *flag, NSString *fmt, ...) {
 
 // 「只报一次」用的开关
 static BOOL sDiagRadiusErr = NO;
+static BOOL sDiagMaskErr   = NO;
 
 #pragma mark - 设置
 
 typedef struct {
-    BOOL   enabled;       // 总开关
-    double maxRadius;     // 满强度时的高斯半径（px）
-    double deadZoneDeg;   // 死区：小于此倾角完全不生效
-    double fullRangeDeg;  // 到这个倾角磨砂拉满
-    double darkening;     // 压暗强度 0…1
-    double frost;         // 白雾强度 0…1
-    double grain;         // 颗粒强度 0…1（默认 0）
-    BOOL   blurWallpaper; // 是否连壁纸一起糊
+    BOOL   enabled;        // 总开关
+    double deadZoneDeg;    // 死区：小于此倾角完全不生效
+    double fullRangeDeg;   // 到这个倾角效果拉满
+    double maxFoldDeg;     // 满强度时玻璃的等效折角（决定模糊/压暗的上限）
+    double blurSpread;     // 每 pt 间隙产生的模糊半径（原作 0.12）
+    double darkening;      // 每 pt 模糊半径损失的光（原作 0.015）
+    double maxBlurRadius;  // 模糊半径硬上限（pt），防止极端倾角糊成一片
+    double maxDim;         // 压暗上限 0…1
+    double eyeDistanceMM;  // 眼睛到屏幕的距离，原作 320mm（仅用于日志）
+    double pointsPerMM;    // 约 6 pt/mm（仅用于日志）
+    BOOL   flipHinge;      // 判断出的铰链方向与实际相反时打开
 } DuoSettings;
 
 #pragma mark - One Euro 滤波器（压掉半径抖动，否则视觉上是「沙沙」闪烁）
@@ -152,13 +181,6 @@ static double duo_oneEuro(DuoOneEuro *f, double x, double dt) {
 }
 
 #pragma mark - 3x3 矩阵工具（把 attitude 换算成「绕屏幕 Y 轴的倾角」）
-
-// 为什么不能用重力向量？
-//   「左右倾」是绕屏幕 Y 轴的滚转。竖握手机时屏幕 Y 轴差不多和重力同向，
-//   绕它转**不改变重力向量** —— 重力在原理上测不到这个旋转。
-//   量化：后仰 25° 的握姿下，左右滚转 20° 只让「重力夹角」变化 8.5°；
-//   滚转 45° 也只有 18.6°。死区一卡就完全没反应。
-// 所以必须用 attitude 全姿态矩阵。做法参考 elijah-semyonov/DuoLikeAnimation（MIT）。
 
 typedef struct { double m[3][3]; } DuoMat3;   // m[行][列]
 
@@ -204,7 +226,7 @@ static void DuoMat3Apply(DuoMat3 a, const double v[3], double out[3]) {
 static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
 
 // ── 姿态 → 绕屏幕 Y 轴的有符号倾角（度）─────────────────────────────
-static double         gTiltDeg;        // 正负号表示哪一侧抬起，留给 1.3 做方向性观感
+static double         gTiltDeg;        // 正负号表示往哪一侧倾 —— 决定铰链落在哪条边
 static BOOL           gTiltValid;      // 参考姿态是否已标定
 static DuoMat3        gRefMat;         // 标定时的姿态矩阵
 static BOOL           gHasRefMat;
@@ -215,7 +237,54 @@ static double         gTiltSmooth;     // 参考项目的轻量平滑状态（�
 static double         gScreenX[3] = {1.0, 0.0, 0.0};
 static double         gScreenY[3] = {0.0, 1.0, 0.0};
 
-static UIImage *DuoGrainImage(void);   // 前向声明
+#pragma mark - 折叠玻璃层
+
+// 水平方向的「清晰 → 模糊」渐变 mask。
+// variableBlur 按 mask 的 alpha 逐像素决定模糊半径：alpha=0 完全不模糊，alpha=1 用满 inputRadius。
+// 铰链那一侧 alpha=0（贴着桌面，最清晰），远端 alpha=1（翘得最高，最糊）。
+//
+// 注意：虽然视觉上是「从清晰到模糊」，但 mask 里画的是**透明到不透明**，
+// 因为 variableBlur 读的是 alpha 通道，不是亮度。
+static CGImageRef DuoCreateFoldMask(BOOL clearAtLeft) {
+    const size_t W = 256, H = 4;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) return NULL;
+
+    CGContextRef ctx = CGBitmapContextCreate(NULL, W, H, 8, W * 4, cs,
+                                             kCGImageAlphaPremultipliedLast);
+    if (!ctx) { CGColorSpaceRelease(cs); return NULL; }
+
+    // 透明黑 → 不透明黑（RGB 恒为 0，只有 alpha 在变）
+    CGFloat comps[8] = { 0, 0, 0, 0,
+                         0, 0, 0, 1 };
+    CGGradientRef grad = CGGradientCreateWithColorComponents(cs, comps, NULL, 2);
+    if (grad) {
+        CGPoint s = clearAtLeft ? CGPointMake(0, 0) : CGPointMake((CGFloat)W, 0);
+        CGPoint e = clearAtLeft ? CGPointMake((CGFloat)W, 0) : CGPointMake(0, 0);
+        CGContextDrawLinearGradient(ctx, grad, s, e,
+                                    kCGGradientDrawsBeforeStartLocation |
+                                    kCGGradientDrawsAfterEndLocation);
+        CGGradientRelease(grad);
+    }
+    CGImageRef img = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    return img;
+}
+
+// 私有 CAFilter 的构造。类名和 selector 都是私有的，所以全部走运行时查找，
+// 拿到 nil 就让调用方降级，绝不硬崩。
+static id DuoCreateCAFilter(NSString *type) {
+    Class CAFilter = NSClassFromString(@"CAFilter");
+    if (!CAFilter) return nil;
+    SEL sel = NSSelectorFromString(@"filterWithType:");
+    if (![CAFilter respondsToSelector:sel]) return nil;
+    id f = nil;
+    @try {
+        f = ((id (*)(id, SEL, id))objc_msgSend)((id)CAFilter, sel, type);
+    } @catch (__unused NSException *e) { f = nil; }
+    return f;
+}
 
 #pragma mark - 控制器
 
@@ -225,11 +294,21 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     CADisplayLink   *_link;
     NSArray         *_targets;
     __weak UIWindow *_host;
-    UIView          *_dimView, *_frostView, *_grainView;
-    id               _blurFilter;
+
+    UIView          *_dimView;        // 方向性压暗层
+    CAGradientLayer *_dimGrad;
+    UIVisualEffectView *_glass;       // 折叠玻璃本体
+    CALayer         *_backdrop;       // _glass 的 CABackdropLayer（weak 持有）
+    id               _foldFilter;     // variableBlur（首选）或 gaussianBlur（降级）
+    BOOL             _usingVariable;  // 当前用的是不是 variableBlur
+    BOOL             _hingeRight;     // 当前铰链在哪一侧
+    BOOL             _hingeValid;     // _hingeRight 是否已确定
+
     DuoSettings      _s;
     BOOL             _attached, _started;
     CGFloat          _amount;
+    double           _radius;            // 最近一次实际下发的模糊半径（pt），仅用于自检
+    double           _tiltSign;          // 最近一次倾角的符号（+1 / -1）
     double           _maxTheta;          // 自检：本次运行见过的最大倾角
     int              _selfTestLeft;      // 自检闪光：还要闪几次
     int              _selfTestCooldown;  // 自检闪光：距下次闪还有多少帧
@@ -253,9 +332,10 @@ static UIImage *DuoGrainImage(void);   // 前向声明
 @interface DuoFoldController ()
 - (void)tick:(CADisplayLink *)link;
 - (void)applyAmount:(CGFloat)amount;
-- (void)attachFilters;
-- (void)detachFilters;
+- (void)attachGlass;
+- (void)detachGlass;
 - (void)hostOverlays;
+- (void)setHingeRight:(BOOL)hingeRight;
 - (void)updateScreenAxes:(UIWindow *)host;
 - (UIView *)homeScreenView;
 - (UIView *)firstViewIn:(NSArray *)roots classLike:(NSString *)needle;
@@ -272,17 +352,24 @@ static UIImage *DuoGrainImage(void);   // 前向声明
 - (instancetype)init {
     if ((self = [super init])) {
         _euro.minCutoff = 1.0; _euro.beta = 0.03; _euro.dCutoff = 1.0;
-        _dimView   = [UIView new];
-        _frostView = [UIView new];
-        _grainView = [UIView new];
-        _dimView.backgroundColor   = [UIColor blackColor];
-        _frostView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:1.0];
-        for (UIView *v in @[_dimView, _frostView, _grainView]) {
-            v.userInteractionEnabled = NO;   // 关键：不能吃掉桌面触摸
-            v.alpha    = 0.0;
-            v.hidden   = YES;
-            v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        }
+        _tiltSign = 1.0;
+
+        // 压暗层：一条水平渐变，铰链侧全透明、远端不透明黑。
+        // 整层再乘一个 alpha 控制总强度 —— 这样既能做「方向性」，又能做「随倾角增强」。
+        _dimView = [UIView new];
+        _dimView.userInteractionEnabled = NO;   // 关键：不能吃掉桌面触摸
+        _dimView.backgroundColor = [UIColor clearColor];
+        _dimView.alpha    = 0.0;
+        _dimView.hidden   = YES;
+        _dimView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+
+        _dimGrad = [CAGradientLayer layer];
+        _dimGrad.colors = @[ (id)[UIColor colorWithWhite:0.0 alpha:0.0].CGColor,
+                             (id)[UIColor colorWithWhite:0.0 alpha:1.0].CGColor ];
+        _dimGrad.locations = @[ @0.0, @1.0 ];
+        _dimGrad.startPoint = CGPointMake(0.0, 0.5);
+        _dimGrad.endPoint   = CGPointMake(1.0, 0.5);
+        [_dimView.layer addSublayer:_dimGrad];
     }
     return self;
 }
@@ -296,10 +383,19 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     // 这样即使 start 从没被调用（只有 dylib 注入成功），文件里也留着 ctor 那行证据。
     DuoDiag(@"=== start() 被调用 ===");
     [self loadSettings];
-    DuoDiag(@"设置: enabled=%d maxRadius=%.1f deadZone=%.1f fullRange=%.1f "
-            @"darkening=%.2f frost=%.2f grain=%.2f blurWallpaper=%d",
-            _s.enabled, _s.maxRadius, _s.deadZoneDeg, _s.fullRangeDeg,
-            _s.darkening, _s.frost, _s.grain, _s.blurWallpaper);
+    DuoDiag(@"设置: enabled=%d deadZone=%.1f fullRange=%.1f maxFold=%.1f° "
+            @"blurSpread=%.3f darkening=%.3f maxRadius=%.1f maxDim=%.2f flipHinge=%d",
+            _s.enabled, _s.deadZoneDeg, _s.fullRangeDeg, _s.maxFoldDeg,
+            _s.blurSpread, _s.darkening, _s.maxBlurRadius, _s.maxDim, _s.flipHinge);
+
+    // 顺手报告一下这块屏幕的物理尺度，方便对着原作参数核对
+    CGRect sb = [UIScreen mainScreen].bounds;
+    double wMM = (sb.size.width * 2 + sb.size.height * 2);
+    DuoDiag(@"屏幕 %.0f×%.0f pt，按 %.1f pt/mm 估算对角线约 %.0f mm；"
+            @"eyeDistance=%.0fpt",
+            sb.size.width, sb.size.height, _s.pointsPerMM,
+            wMM / 2.0 / _s.pointsPerMM,
+            _s.eyeDistanceMM * _s.pointsPerMM);
 
     _motion = [CMMotionManager new];
     _motion.deviceMotionUpdateInterval = 1.0 / 60.0;
@@ -309,7 +405,7 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     q.qualityOfService = NSQualityOfServiceUtility;
     _motionQueue = q;      // 自己持有一份，别指望 CoreMotion 一定 retain
 
-    // 参考项目用 120Hz；这里跟显示刷新率走 60Hz 已经够（display link 也是 60）
+    // 原作跑 120Hz；这里跟显示刷新率走 60Hz 已经够（display link 也是 60）
     [_motion startDeviceMotionUpdatesUsingReferenceFrame:CMAttitudeReferenceFrameXArbitraryZVertical
                                                  toQueue:q
                                              withHandler:^(CMDeviceMotion *m, NSError *err) {
@@ -321,7 +417,6 @@ static UIImage *DuoGrainImage(void);   // 前向声明
 
         double tiltDeg = 0.0;
         BOOL   gotRef  = NO;
-        double convScore = 0.0;
 
         os_unfair_lock_lock(&gLock);
         {
@@ -341,8 +436,7 @@ static UIImage *DuoGrainImage(void);   // 前向声明
                     DuoMat3Apply(DuoMat3Transpose(asRows), down, p2);
                     double s1 = DuoVec3Dot(gv, p1);
                     double s2 = DuoVec3Dot(gv, p2);
-                    convScore = fabs(s1 - s2);
-                    if (convScore > 0.2) gRowConv = (s1 > s2) ? 1 : 0;
+                    if (fabs(s1 - s2) > 0.2) gRowConv = (s1 > s2) ? 1 : 0;
                 }
             }
             DuoMat3 d2r = (gRowConv == 1) ? DuoMat3Transpose(asRows) : asRows;
@@ -351,22 +445,21 @@ static UIImage *DuoGrainImage(void);   // 前向声明
                 // 等设备静止一下再定参考（最多等 1 秒），避免开机瞬间手在动导致参考跑偏
                 gCalibCount++;
                 if (rate < 0.15 || gCalibCount > 60) {
-                    gRefMat    = d2r;
-                    gHasRefMat = YES;
+                    gRefMat     = d2r;
+                    gHasRefMat  = YES;
                     gTiltSmooth = 0.0;
-                    gTiltDeg   = 0.0;
-                    gotRef     = YES;
+                    gTiltDeg    = 0.0;
+                    gotRef      = YES;
                 }
             } else {
-                // relative = reference^T * current，它的第三列就是「当前屏幕法线在标定系里的坐标」
+                // relative = reference^T * current，第三列是当前屏幕法线
                 DuoMat3 rel = DuoMat3Mul(DuoMat3Transpose(gRefMat), d2r);
                 double nx = rel.m[0][2], ny = rel.m[1][2], nz = rel.m[2][2];
 
                 // 绕屏幕 Y 轴的有符号倾角（屏幕 X 轴朝向由界面朝向决定）
                 double measured = atan2(nx * gScreenX[0] + ny * gScreenX[1] + nz * gScreenX[2], nz);
 
-                // 陀螺仪前瞻 40ms：补掉「传感器 → 合成 → 显示」这条链路的延迟，
-                // 不然手上动作和画面之间会有明显脱节
+                // 陀螺仪前瞻 40ms：补掉「传感器 → 合成 → 显示」这条链路的延迟
                 double rateY = m.rotationRate.x * gScreenY[0]
                              + m.rotationRate.y * gScreenY[1]
                              + m.rotationRate.z * gScreenY[2];
@@ -377,8 +470,8 @@ static UIImage *DuoGrainImage(void);   // 前向声明
                 tiltDeg = gTiltSmooth * 180.0 / M_PI;
             }
 
-            gTiltDeg      = tiltDeg;
-            gTiltValid    = gHasRefMat;
+            gTiltDeg   = tiltDeg;
+            gTiltValid = gHasRefMat;
         }
         os_unfair_lock_unlock(&gLock);
 
@@ -419,7 +512,7 @@ static UIImage *DuoGrainImage(void);   // 前向声明
 // 得给他解锁并看到桌面的时间。
 //
 // 用途：不用看任何日志就能判断「渲染通路到底通不通」——
-//   看得到屏幕变糊 → 挂载 / filter 都没问题，问题一定出在驱动量（倾角算出来太小）
+//   看得到屏幕变糊 → 挂载 / filter 都没问题，问题一定出在驱动量
 //   看不到          → 是加载或挂载环节的问题
 - (void)armSelfTest {
     _selfTestLeft = 6;
@@ -469,9 +562,11 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     // ── 驱动量 ────────────────────────────────────────────────────────
     // tiltDeg 是「绕屏幕 Y 轴的滚转角」，也就是真正意义上的左右倾：
     //   竖握手机滚转 20° → 这里就是 20°（旧的「重力夹角」写法只有 8.5°，会被死区整个吃掉）
-    // 正负号 = 哪一侧抬起，1.3 做方向性观感时会用到；强度只用绝对值。
     double theta = fabs(tiltDeg);
     if (theta > _maxTheta) _maxTheta = theta;
+
+    // 符号决定铰链落在哪一侧 —— 这就是「往左倾/往右倾」在观感上的分界
+    if (fabs(tiltDeg) > _s.deadZoneDeg) _tiltSign = (tiltDeg > 0) ? 1.0 : -1.0;
 
     double span  = MAX(1.0, _s.fullRangeDeg - _s.deadZoneDeg);
     double raw   = duo_clamp((theta - _s.deadZoneDeg) / span, 0.0, 1.0);
@@ -479,13 +574,14 @@ static UIImage *DuoGrainImage(void);   // 前向声明
 
     CGFloat amount = (CGFloat)duo_clamp(duo_oneEuro(&_euro, raw, dt), 0.0, 1.0);
 
-    // 自检心跳：每 5 秒一行，倾斜手机时看 tilt / amount 有没有跟着变
+    // 自检心跳：每 5 秒一行，倾斜手机时看 tilt / amount / radius 有没有跟着变
     if ((_ticks % 300) == 0) {
-        DuoDiag(@"tick=%lu  tilt=%+.1f°(峰值%.1f°)  raw=%.3f  amount=%.3f  "
-                @"targets=%lu  attached=%d  filter=%@  deadZone=%.0f fullRange=%.0f",
-                (unsigned long)_ticks, tiltDeg, _maxTheta, raw, amount,
-                (unsigned long)_targets.count, _attached,
-                _blurFilter ? @"有" : @"无", _s.deadZoneDeg, _s.fullRangeDeg);
+        DuoDiag(@"tick=%lu  tilt=%+.1f°(峰值%.1f°)  raw=%.3f  amount=%.3f  radius=%.1fpt  "
+                @"hinge=%@  mode=%@  targets=%lu  attached=%d",
+                (unsigned long)_ticks, tiltDeg, _maxTheta, raw, amount, _radius,
+                _hingeValid ? (_hingeRight ? @"右" : @"左") : @"未定",
+                _usingVariable ? @"variableBlur" : (_foldFilter ? @"gaussianBlur" : @"无"),
+                (unsigned long)_targets.count, _attached);
     }
 
     [self applyAmount:amount];
@@ -497,75 +593,176 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     BOOL want = amount > 0.002;
 
     if (!want) {
-        if (_attached) [self detachFilters];
+        if (_attached) [self detachGlass];
         _amount = 0.0;
         return;
     }
 
-    // 刚挂上 filter 时必须无条件写一遍数值。
-    // refreshTargets 每 2 秒会先 detachFilters（三个覆盖层 alpha 归零、hidden=YES），
-    // 再用同一个 _amount 重新调进来；若这里直接命中「变化太小」的短路返回，
-    // 覆盖层就永久停在 alpha=0 —— 表现为效果「只剩模糊、压暗/白雾/颗粒全没了」。
+    // 刚挂上时（或刚重建过）必须无条件写一遍数值。
+    // hostOverlays / refreshTargets 会重建玻璃层，若这里直接命中「变化太小」的
+    // 短路返回，新层就永久停在「没有 filter」的状态 —— 表现为效果时有时无。
     BOOL justAttached = NO;
     if (!_attached) {
-        [self attachFilters];
+        [self attachGlass];
         if (!_attached) return;
         justAttached = YES;
     }
     if (!justAttached && fabs(amount - _amount) < 0.0015) return;   // 变化太小就不动，省开销
     _amount = amount;
 
+    // ── 铰链方向 ──────────────────────────────────────────────────────
+    // 往哪边倾，玻璃就绕那一边合拢。
+    // 若真机上发现方向反了（向右倾时左边在糊），把 prefs 里的 flipHinge 打开即可。
+    BOOL hingeRight = ((_tiltSign > 0) ? YES : NO) ^ _s.flipHinge;
+    if (!_hingeValid || hingeRight != _hingeRight) {
+        [self setHingeRight:hingeRight];
+    }
+
+    // ── 几何 → 模糊半径 ───────────────────────────────────────────────
+    // 折角 θ 由强度映射而来；玻璃上离铰链 d 处的间隙是 d·sin(θ)。
+    // 我们只关心「最远处」的间隙（屏幕宽度 w），据此算这条渐变的满量程半径。
+    CGFloat w = _glass ? _glass.bounds.size.width : [UIScreen mainScreen].bounds.size.width;
+    double  foldRad = amount * _s.maxFoldDeg * M_PI / 180.0;
+    double  gapMax  = w * sin(foldRad);
+    double  radius  = _s.blurSpread * gapMax;
+
+    if (radius > _s.maxBlurRadius) radius = _s.maxBlurRadius;
+
+    // 1) 变半径模糊：inputRadius 是满量程，mask 的 alpha 逐像素调制它
     @try {
-        [_blurFilter setValue:@(_s.maxRadius * amount) forKey:@"inputRadius"];
+        [_foldFilter setValue:@(radius) forKey:@"inputRadius"];
     } @catch (NSException *e) {
         DuoDiagOnce(&sDiagRadiusErr, @"!! 设置 inputRadius 失败: %@", e.reason);
     }
-    _dimView.alpha   = _s.darkening * amount;
-    _frostView.alpha = _s.frost * amount;
-    _grainView.alpha = _s.grain * amount;
+
+    // 2) 方向性压暗：越远越糊，也越暗（原作 darkening × 半径）
+    double dim = duo_clamp(_s.darkening * radius, 0.0, _s.maxDim);
+    // 压暗的梯度本身也跟着折角走 —— 一点都不折的时候不该有暗角
+    _dimView.alpha = dim;
+
+    _radius = radius;
+
+    // 3) 自检：刚挂上时报告一次实际生效的几何量
+    if (justAttached) {
+        DuoDiag(@"几何: 宽=%.0fpt 折角=%.1f° 最大间隙=%.1fpt → 半径=%.1fpt 压暗=%.2f",
+                w, foldRad * 180.0 / M_PI, gapMax, radius, dim);
+    }
 }
 
-#pragma mark 挂载 / 卸载 filter
+#pragma mark 挂载 / 卸载玻璃层
 
-- (void)attachFilters {
-    if (!_blurFilter) {
-        Class CAFilter = NSClassFromString(@"CAFilter");
-        if (!CAFilter) { DuoDiag(@"!! CAFilter 类不存在（私有 API 可能改名了）"); return; }
-        @try {
-            _blurFilter = [CAFilter filterWithName:@"gaussianBlur"];
-            // 关键：不加这行，高斯模糊会让屏幕四边发暗
-            [_blurFilter setValue:@YES forKey:@"inputNormalizeEdges"];
-            DuoDiag(@"CAFilter 创建成功: %@", _blurFilter);
-        } @catch (NSException *e) {
-            DuoDiag(@"!! CAFilter 创建/设值异常: %@", e.reason);
-            _blurFilter = nil;
-        }
-        if (!_blurFilter) { DuoDiag(@"!! _blurFilter 为 nil，放弃挂载"); return; }
-    }
+// 用 UIVisualEffectView 拿到私有的 CABackdropLayer —— 它能实时抓取「这一层下方已渲染的所有内容」
+// （桌面图标、壁纸、文件夹……），我们再把它默认的 gaussianBlur 换成 variableBlur，
+// 就得到了「按距离变化的模糊」。这是 SpringBoard 里唯一不用自己搭渲染管线就能做到渐变模糊的路子。
+- (void)attachGlass {
     if (_targets.count == 0) { DuoDiag(@"!! _targets 为空，没有可挂载的视图"); return; }
 
-    NSUInteger failed = 0;
-    for (UIView *v in _targets) {
-        @try { v.layer.filters = @[_blurFilter]; }
-        @catch (NSException *e) {
-            failed++;
-            DuoDiagOnce(&sDiagRadiusErr, @"!! 给 %@ 设置 layer.filters 失败: %@",
-                        NSStringFromClass(v.class), e.reason);
+    UIWindow *host = ((UIView *)_targets[0]).window;
+    if (!host) { DuoDiag(@"!! _targets[0] 还没有 window"); return; }
+
+    if (!_foldFilter) {
+        // 首选 variableBlur：按 mask 逐像素调半径
+        id f = DuoCreateCAFilter(@"variableBlur");
+        if (f) {
+            _usingVariable = YES;
+            DuoDiag(@"CAFilter(variableBlur) 创建成功");
+        } else {
+            // 降级：均匀半径的 gaussianBlur。方向性要完全靠压暗层来暗示，观感会弱一些。
+            f = DuoCreateCAFilter(@"gaussianBlur");
+            _usingVariable = NO;
+            DuoDiag(f ? @"!! variableBlur 不可用，已降级到 gaussianBlur"
+                      : @"!! CAFilter 两种类型都创建失败（私有 API 可能改名了）");
         }
+        if (!f) return;
+        @try { [f setValue:@YES forKey:@"inputNormalizeEdges"]; }
+        @catch (NSException *e) { DuoDiag(@"!! inputNormalizeEdges 设置失败: %@", e.reason); }
+        _foldFilter = f;
     }
-    DuoDiag(@"已给 %lu 个视图挂上 filter（失败 %lu）", (unsigned long)_targets.count, (unsigned long)failed);
+
+    // 建立玻璃层（已存在就复用，只重新挂到当前 window）
+    if (!_glass) {
+        UIBlurEffect *eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleRegular];
+        _glass = [[UIVisualEffectView alloc] initWithEffect:eff];
+        _glass.userInteractionEnabled = NO;      // 关键：桌面照常可点
+        _glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    }
+    if (_glass.superview != host || _glass.frame.size.width < 1) {
+        [_glass removeFromSuperview];
+        _glass.frame = host.bounds;
+        [host addSubview:_glass];
+    }
+    [host bringSubviewToFront:_glass];
+
+    // UIVisualEffectView 的第一个子视图就是 CABackdropLayer 的宿主。
+    // 把它的 filters 换成我们的那一个，并把其余子视图（tint / dimming）隐藏掉 ——
+    // 否则会看到一条生硬的色带。
+    UIView *backdropView = _glass.subviews.firstObject;
+    _backdrop = backdropView.layer;
+    if (!_backdrop) {
+        DuoDiag(@"!! 取不到 CABackdropLayer（UIVisualEffectView 结构变了）");
+        return;
+    }
+    @try {
+        _backdrop.filters = @[ _foldFilter ];
+    } @catch (NSException *e) {
+        DuoDiag(@"!! 设置 backdrop.filters 失败: %@", e.reason);
+    }
+    for (UIView *sv in _glass.subviews) {
+        if (sv != backdropView) sv.alpha = 0.0;
+    }
+    @try {
+        [_backdrop setValue:@([UIScreen mainScreen].scale) forKey:@"scale"];
+    } @catch (__unused NSException *e) {}
+
+    // 先给它一个 mask，否则 variableBlur 在没有 mask 时行为未定义
+    [self setHingeRight:YES];
+
     [self hostOverlays];
-    _dimView.hidden = _frostView.hidden = _grainView.hidden = NO;
+    _dimView.hidden = NO;
     _attached = YES;
+
+    DuoDiag(@"玻璃层已挂到 %@（%@）",
+            NSStringFromClass(host.class), _usingVariable ? @"variableBlur" : @"gaussianBlur");
 }
 
-- (void)detachFilters {
-    for (UIView *v in _targets) {
-        @try { v.layer.filters = nil; } @catch (__unused NSException *e) {}
+- (void)detachGlass {
+    if (_glass) {
+        [_glass removeFromSuperview];
+        _glass = nil;
+        _backdrop = nil;
     }
-    _dimView.alpha = _frostView.alpha = _grainView.alpha = 0.0;
-    _dimView.hidden = _frostView.hidden = _grainView.hidden = YES;
+    _dimView.alpha = 0.0;
+    _dimView.hidden = YES;
     _attached = NO;
+    _hingeValid = NO;
+}
+
+// 换铰链侧：重建 mask，并把压暗渐变的方向翻过来
+- (void)setHingeRight:(BOOL)hingeRight {
+    _hingeRight = hingeRight;
+    _hingeValid = YES;
+
+    if (_usingVariable) {
+        CGImageRef mask = DuoCreateFoldMask(/* clearAtLeft */ !hingeRight);
+        if (mask) {
+            @try {
+                [_foldFilter setValue:(__bridge id)mask forKey:@"inputMaskImage"];
+            } @catch (NSException *e) {
+                DuoDiagOnce(&sDiagMaskErr, @"!! 设置 inputMaskImage 失败: %@", e.reason);
+            }
+            CGImageRelease(mask);
+        }
+    }
+
+    // 压暗层的亮暗方向：铰链侧透明（清晰）、远端不透明（暗）
+    // startPoint 是 colors[0] 的位置，所以「透明端」要落在铰链那一侧
+    _dimGrad.startPoint = hingeRight ? CGPointMake(1.0, 0.5) : CGPointMake(0.0, 0.5);
+    _dimGrad.endPoint   = hingeRight ? CGPointMake(0.0, 0.5) : CGPointMake(1.0, 0.5);
+    _dimGrad.frame      = _dimView.bounds;
+
+    if ((_ticks % 300) == 0) {
+        DuoDiag(@"铰链换到%@侧", hingeRight ? @"右" : @"左");
+    }
 }
 
 #pragma mark 目标视图解析（多策略兜底，覆盖 iOS 15/16/17）
@@ -633,14 +830,6 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     UIView *home = [self homeScreenView];
     if (home) [found addObject:home];
 
-    if (_s.blurWallpaper) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.hidden || w.alpha < 0.01) continue;
-            UIView *wp = [self firstViewIn:@[w] classLike:@"WallpaperView"];
-            if (wp && ![found containsObject:wp]) [found addObject:wp];
-        }
-    }
-
     // 自检：目标集合发生变化时记一行
     NSMutableArray *names = [NSMutableArray array];
     for (UIView *v in found) [names addObject:NSStringFromClass(v.class)];
@@ -656,9 +845,14 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     // 而倾角计算必须知道屏幕的竖直轴到底指向哪，否则横屏时左右倾会算成前后倾。
     [self updateScreenAxes:(found.count ? ((UIView *)found[0]).window : nil)];
 
-    [self detachFilters];          // 先卸旧的
     _targets = found;
-    if (_amount > 0.002) [self applyAmount:_amount];
+
+    // 已经在跑就把玻璃重新挂到（可能变化了的）窗口上，但不要整个拆掉重建 ——
+    // 拆了再建会闪一下，而且会丢掉当前的 mask。
+    if (_attached) {
+        [self hostOverlays];
+        if (_glass && _glass.superview != _host) [self attachGlass];
+    }
 }
 
 // 把屏幕的竖直轴（绕它转才是「左右倾」）换算到设备坐标系，供传感器队列使用
@@ -699,41 +893,50 @@ static UIImage *DuoGrainImage(void);   // 前向声明
     os_unfair_lock_unlock(&gLock);
 }
 
-#pragma mark 覆盖层（压暗 / 白雾 / 颗粒）
+#pragma mark 压暗层
 
 - (void)hostOverlays {
     UIWindow *host = _targets.count ? ((UIView *)_targets[0]).window : nil;
-    if (!host) { DuoDiag(@"!! 找不到承载覆盖层的 window，压暗/白雾/颗粒不会显示"); return; }
-    if (_host == host && _dimView.superview == host) return;
-    _host = host;
-    for (UIView *v in @[_dimView, _frostView, _grainView]) {
-        [v removeFromSuperview];
-        v.frame = host.bounds;
-        [host addSubview:v];
+    if (!host) { DuoDiag(@"!! 找不到承载压暗层的 window"); return; }
+    if (_host == host && _dimView.superview == host) {
+        _dimGrad.frame = _dimView.bounds;
+        return;
     }
-    DuoDiag(@"覆盖层已挂到 window (%@)", NSStringFromClass(host.class));
+    _host = host;
+    [_dimView removeFromSuperview];
+    _dimView.frame = host.bounds;
+    [host addSubview:_dimView];
+    [host bringSubviewToFront:_dimView];
+    _dimGrad.frame = _dimView.bounds;
+    DuoDiag(@"压暗层已挂到 window (%@)", NSStringFromClass(host.class));
 }
 
 #pragma mark 设置
 
 - (void)loadSettings {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:DUO_PREFS];
+    // v2.1 起有设置面板了：面板经 cfprefsd 写入，**直接读文件可能拿到旧值**
+    // （cfprefsd 异步落盘）。所以首选 CFPreferences —— 它读的是 cfprefsd 的内存缓存。
+    CFPreferencesAppSynchronize((__bridge CFStringRef)DUO_BUNDLE);
+    NSDictionary *d = CFBridgingRelease(CFPreferencesCopyAppValue(
+        (__bridge CFStringRef)DUO_BUNDLE, kCFPreferencesCurrentUser));
+
+    // 兜底：不走面板、手动创建的旧 plist 文件
+    if (!d) d = [NSDictionary dictionaryWithContentsOfFile:DUO_PREFS];
     DuoSettings s;
     s.enabled       = d[@"enabled"]       ? [d[@"enabled"] boolValue]        : YES;
-    s.maxRadius     = d[@"maxRadius"]     ? [d[@"maxRadius"] doubleValue]    : 26.0;
-    // 1.2 起驱动量换成了「绕屏幕 Y 轴的滚转角」，量纲就是真实的倾角，
-    // 所以默认值回到符合直觉的区间：几乎无死区，25° 左右拉满
+    // 驱动量是「绕屏幕 Y 轴的滚转角」，量纲就是真实倾角，所以默认值回到符合直觉的区间
     s.deadZoneDeg   = d[@"deadZoneDeg"]   ? [d[@"deadZoneDeg"] doubleValue]  : 2.0;
     s.fullRangeDeg  = d[@"fullRangeDeg"]  ? [d[@"fullRangeDeg"] doubleValue] : 25.0;
-    s.darkening     = d[@"darkening"]     ? [d[@"darkening"] doubleValue]    : 0.35;
-    s.frost         = d[@"frost"]         ? [d[@"frost"] doubleValue]        : 0.08;
-    s.grain         = d[@"grain"]         ? [d[@"grain"] doubleValue]        : 0.0;
-    s.blurWallpaper = d[@"blurWallpaper"] ? [d[@"blurWallpaper"] boolValue]  : YES;
+    // 满强度时等效折角。原作 demo 里约 20°，这里取 22° 让半径落在 17pt 左右
+    s.maxFoldDeg    = d[@"maxFoldDeg"]    ? [d[@"maxFoldDeg"] doubleValue]   : 22.0;
+    s.blurSpread    = d[@"blurSpread"]    ? [d[@"blurSpread"] doubleValue]   : 0.12;
+    s.darkening     = d[@"darkening"]     ? [d[@"darkening"] doubleValue]    : 0.015;
+    s.maxBlurRadius = d[@"maxBlurRadius"] ? [d[@"maxBlurRadius"] doubleValue]: 26.0;
+    s.maxDim        = d[@"maxDim"]        ? [d[@"maxDim"] doubleValue]       : 0.45;
+    s.eyeDistanceMM = d[@"eyeDistanceMM"] ? [d[@"eyeDistanceMM"] doubleValue]: 320.0;
+    s.pointsPerMM   = d[@"pointsPerMM"]   ? [d[@"pointsPerMM"] doubleValue]  : 6.0;
+    s.flipHinge     = d[@"flipHinge"]     ? [d[@"flipHinge"] boolValue]      : NO;
     _s = s;
-
-    if (s.grain > 0.001 && !_grainView.backgroundColor) {
-        _grainView.backgroundColor = [UIColor colorWithPatternImage:DuoGrainImage()];
-    }
 }
 
 - (void)calibrate {
@@ -750,27 +953,6 @@ static UIImage *DuoGrainImage(void);   // 前向声明
 }
 
 @end
-
-#pragma mark - 程序化噪点贴图（磨砂颗粒感，不依赖任何图片资源）
-
-static UIImage *DuoGrainImage(void) {
-    static UIImage *img; static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        const int S = 128;
-        uint8_t *buf = calloc(S * S * 4, 1);
-        for (int i = 0; i < S * S; i++) {
-            uint8_t a = (uint8_t)(arc4random_uniform(256));
-            buf[i*4+0] = a; buf[i*4+1] = a; buf[i*4+2] = a; buf[i*4+3] = a;  // 预乘白噪声
-        }
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        CGContextRef ctx = CGBitmapContextCreate(buf, S, S, 8, S * 4, cs,
-                                                 kCGImageAlphaPremultipliedLast);
-        CGImageRef cg = CGBitmapContextCreateImage(ctx);
-        if (cg) { img = [UIImage imageWithCGImage:cg]; CGImageRelease(cg); }
-        CGContextRelease(ctx); CGColorSpaceRelease(cs); free(buf);
-    });
-    return img;
-}
 
 #pragma mark - 入口
 

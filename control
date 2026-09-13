@@ -1,8 +1,8 @@
 Package: com.yourname.duofold
 Name: DuoFold
-Version: 1.2.0
+Version: 2.1.0
 Architecture: iphoneos-arm
-Description: 用陀螺仪把桌面变成一块磨砂玻璃——倾斜越多越糊，回正则恢复清晰。
+Description: 倾斜手机，桌面像一块玻璃盖板在合拢——铰链边清晰，越远越糊越暗。设置入口：设置 → DuoFold。
 Maintainer: yourname
 Author: yourname
 Section: Tweaks
