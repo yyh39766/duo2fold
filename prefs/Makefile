@@ -14,6 +14,11 @@ DuoFoldPrefs_FILES              = DuoFoldPrefs.m
 DuoFoldPrefs_CFLAGS             = -fobjc-arc -Wno-deprecated-declarations
 DuoFoldPrefs_FRAMEWORKS         = UIKit Foundation
 DuoFoldPrefs_PRIVATE_FRAMEWORKS = Preferences
+# 苹果的 Xcode SDK 里不带私有框架 Preferences（ld: framework 'Preferences' not found），
+# theos/sdks 的 iPhoneOS16.5.sdk 里有 Preferences.tbd —— 加一条 -F 让链接器找到它。
+# 只用于链接期符号解析（PSListController 的类符号），运行时由 Settings 进程自带的
+# Preferences.framework 提供实现，版本差一档没有影响。
+DuoFoldPrefs_LDFLAGS            = -F$(THEOS)/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks
 DuoFoldPrefs_INSTALL_PATH       = /Library/PreferenceBundles
 
 include $(THEOS_MAKE_PATH)/bundle.mk
