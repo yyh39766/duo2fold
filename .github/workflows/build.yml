@@ -1,0 +1,66 @@
+name: Build DuoFold deb
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (rootless, arm64 + arm64e)
+    runs-on: macos-14
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install ldid / xz
+        run: brew install ldid xz
+
+      - name: Setup Theos and iOS SDKs
+        run: |
+          set -e
+
+          # Theos 本体 + 全部子模块（vendored 的 dm.pl / logos / headers / lib 等，共约 13MB）。
+          # 不要写成 "--recursive --depth 1"：浅克隆下子模块指向的固定 commit 常常取不到，
+          # 会报 "fatal: reference is not a tree" -> exit 128。
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+          # iOS SDK。
+          # 关键：theos 仓库里本来就带一个 sdks/ 占位目录（里面是 0 字节的 .keep），
+          # 直接 git clone 进去会报
+          #   fatal: destination path '.../theos/sdks' already exists and is not an empty directory
+          # -> exit code 128。所以必须先清掉它。
+          rm -rf "$THEOS/sdks"
+          git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
+
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Theos
+        run: |
+          echo "THEOS = $THEOS"
+          echo "--- \$THEOS/sdks ---"
+          ls "$THEOS/sdks"
+          echo "--- \$THEOS/vendor ---"
+          ls "$THEOS/vendor"
+          echo "--- \$THEOS/bin ---"
+          ls "$THEOS/bin" | head -20
+
+      - name: Build package
+        run: |
+          set -e
+          make clean
+          make package FINALPACKAGE=1
+          ls -la packages/
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v6
+        with:
+          name: DuoFold-deb
+          path: packages/*.deb
+          if-no-files-found: error
